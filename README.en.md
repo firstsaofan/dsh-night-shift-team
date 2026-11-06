@@ -206,6 +206,10 @@ If you are present, none of the "default decisions" apply — the agent asks as 
 2. **Host-level watchdog** (optional, one per machine): `pwsh -NoProfile -File scripts/windows/setup.ps1` (Windows) or `bash scripts/macos/setup.sh` (macOS, untested). Registers a 10-minute scheduled check that starts DSH **only when a night-shift run is registered and the process is gone**. On Windows the task runs `watchdog-launch.vbs` through `wscript.exe`, so no console window flashes every 10 minutes. It does **not** register login auto-start.
 3. **Models — inherited, not configurable (B repo)**: `SpawnTeammateRequest` has **no `model` field**; every persistent teammate inherits the session model. There is **no** `tool-subagent.agentOptions` / `modelSelectionSettings` / `maxTokens` here — those belong to A repo `night-shift`. To make a whole night cheap, create the session with a cheap model; for cheap-worker / expensive-orchestrator **model routing**, use A instead (never mix A and B, see above). Also **verify the plugin track** in every new conversation: `spawn_teammate` / `list_agents` / `send_message` / `team_task_*` must exist (**the only hard check**; `create_worktree` is checked only for `isolation: worktree`). Do **not** require `subagent` / `subagent_fork` to be absent — a 2026-11-06 test found them still listed; a mismatch blocks the gate and prints a switch-track hint.
 4. **Retries**: keep the default (5). Do **not** set `retryPolicy: always` globally — it is provider-wide and would affect daytime sessions. Night-shift failures are absorbed by the heartbeat instead.
+5. **Companion plugin (optional — two install options)**: [`dsh-plugin-schedule-sweep`](https://www.npmjs.com/package/dsh-plugin-schedule-sweep?activeTab=readme) clears queued heartbeat messages at wrap-up.
+   - **npm** (recommended): `npm i dsh-plugin-schedule-sweep`
+   - **From source**: `dsh plugin --profile desktop add https://github.com/firstsaofan/dsh-plugin-schedule-sweep` (repo ships built artifacts, no local build needed)
+   Restart DSH after either, then add `dsh-plugin-schedule-sweep` to `dsh.profile.bundles` in `profiles/desktop/package.json`.
 
 ---
 
