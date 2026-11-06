@@ -1,0 +1,269 @@
+---
+name: night-shift-team
+description: '无人值守流水线（Agent Teams 版，不限夜间）——人不在设备前时用 DSH 内置 Agent Teams 持久队友自主完成任务列表（多任务并发、拆票建卡、持久审阅、返工闭环、合并交付；并完整保留验证证据、习惯决策树、决策日志、任务总结、晨间简报、升级标记、挂机门禁、心跳、看门狗）。当用户说"夜班"、"挂机"、"无人值守"、"睡觉/出门/开会/通勤时自动跑"、"自动完成 BUG-BOARD/任务清单"，或声明"我不在/去休息了/离开电脑/出门了"让任务自动推进，且项目为中大型 / 需要多任务并发与 review 时使用。Unattended automation (Agent Teams edition): when the human is away, autonomously complete the task list with persistent teammates, a shared task board, a review/rework loop, evidence-based verification, habit defaults, decision log and a morning brief.'
+---
+
+# Night Shift Team 无人值守流水线（Agent Teams 版）
+
+> 名字叫 night-shift-team，但**适用条件是"人不在设备前"，不是"晚上"**——出门、开会、通勤、吃饭都算。
+>
+> 🚨 **硬前提（不满足则整个 skill 不可用）**：本 DSH 实例必须已启用两个实验性插件（**插件 → 实验性插件 → 启动智能体团队插件 + git 工作树**，或改 `profiles/<profile>/package.json` 的 `dsh.profile.bundles` 后重启 DSH）。① **智能体团队**提供 `spawn_teammate` / `send_message` / `team_task_*`，**所有场景必需**；② **git 工作树**提供 `create_worktree`，**仅 `isolation: worktree`（编码 + git）需要**（`write-scopes` / 非 git 不需要）。agent-team 本身不带 worktree 隔离、无文件系统锁。工具只在对应插件加载后存在；未启用 → §2A.1 轨道自检判 `FAIL` → 门禁不放行（不弹 `present` 卡片 / 不生成 `GATE.md` / 不挂 Goal），**不降级、不 fallback、不静默继续**。启用插件是本机一次性配置；本 skill 只是 markdown，不改运行时、不 fork 插件、不装包。
+>
+> **本仓是 B 仓**：完整保留 A 仓 `night-shift` 的全部机制，只把「派工层」换成 DSH 内置的 **Agent Teams 插件**（`spawn_teammate` / `send_message` / `team_task_*`），用于中大型项目的多任务并发、review、返工与合并。A 仓一行未改。
+>
+> ⚠️ **A/B 不可混用**：同一台 DSH 实例、同一时间只能用 A 仓或 B 仓其中之一。**理由不是「工具互斥」**——2026-11-06 实测 `subagent` / `subagent_fork` 与 `spawn_teammate` / `team_task_*` 可在同一实例共存——而是两个 skill 会争用同一套运行时基础设施（项目内 `night-shift/` 状态目录、`DECISIONS.md`、心跳、主机级 `runs/` 运行登记表、Goal、看门狗单进程假设），且编排互斥（一次性 subagent vs 持久队友 + 共享任务板）。Agent Teams 由 **profile 的 `dsh.profile.bundles`** 决定，是**实例级全局**开关；新对话只能选 preset，选不了 profile。切换轨道 = 改 bundle **并重启 DSH**。详见两个 README 顶部声明。
+
+## 0. 模式判定
+
+仅当用户声明**无人值守**时按本技能运行。**任何"人不在场"的时段都算**：夜班、挂机、出门、开会、通勤、吃饭、睡觉——不限夜间。用户在场时一切照常——该问就问，本技能的"默认处置"不生效。
+
+首次进入模式时在工作区根创建状态目录（不存在则创建）：
+
+```
+night-shift/
+├── preflights/       # 开工预检单 preflights/<日期>.md——一晚一份，不覆盖
+├── DECISIONS.md      # 决策日志（append-only；含"习惯回写"记录）
+├── briefs/           # 晨间简报 briefs/<日期>.md——一晚一份，不覆盖
+├── BRIEF.md          # 最新简报指针（内容指向 briefs/ 最新一份）
+├── ESCALATION.md     # 升级候选（append-only）
+├── HEARTBEAT.md      # 心跳提醒 id 记录（崩溃自动续跑用）
+├── GATE.md           # 挂机门禁结果（§0.8 硬动作：没有它 = 门禁没执行）
+├── summaries/        # 任务总结，一任务一份（原始层）
+└── evidence/         # 验证证据 evidence/<日期>/——测试输出/截图（原始层）
+```
+
+**原始层纪律**：`preflights/`、`briefs/`、`DECISIONS.md`、`ESCALATION.md`、`summaries/`、`evidence/` 全部**按日期 append-only——永不改写、永不删除**；**允许按年整体归档迁移**（移到 `archive/<年>/`，文件名与内部结构不变、索引 `archive/INDEX.md` 保留；`DECISIONS.md`/`ESCALATION.md` 是单文件，**不迁移**）。数据清洗前保留源数据，借鉴用户 docs/archive 归档实践；**覆盖旧档 = 违规**，记入 ESCALATION。
+
+**运行期保障（夜班最大的单点故障：重启/唤醒后不会自己续跑）**：
+
+1. **开工先验续行**：挂 Goal 后确认续行已启用——若会话曾 resume/fork，goal 续行会保持**停用**，需用户明确授权 resume，**引擎不会自行复活**。
+2. **记录启动时间戳**，写进当天简报"运行完整性"区。
+3. **中断即报告**：若本夜发生进程重启/崩溃/唤醒，或发现续行处于停用状态 → **不得静默继续**，必须在 `briefs/<日期>.md` 写明"中断点 + 中断原因 + 需手动 resume"，并记 ESCALATION。
+4. **不假装跑满**：简报"运行完整性"只能如实填"跑满 / 中断于 <任务> / 未启动"。
+5. **心跳保活（崩溃后自动续跑的原生机制）**：开工时用 `schedule_create` 建**周期**提醒，**时序参数必须是 `every_seconds`**——⚠️ **不是 `after_seconds`**（那是一次性延迟：到点若会话正忙则投递失败，且不会再响，DSH 重启后永失；2026-11-01 实测踩过两次）。值读 `$DSH_HOME/night-shift/config.json` 的 `heartbeatSeconds`（默认 900 = 15 分钟），不要写死；id 记入 `night-shift/HEARTBEAT.md`。依据 `dsh-schedule`：**周期型**提醒宿主重启后仍可用，到期时**宿主恢复冷会话**并补发最近一次错过的发生时点（"Delivery can repeat after a crash"）→ DSH 崩溃重启后，心跳会自动把夜班接上，不依赖 goal 续行（后者重启后需人授权）。
+   - **时序参数六选一，本 skill 只允许 `every_seconds`，其余五个禁用**（`schedule_create` 的参数是互斥的，选一个就够）：
+
+     | 参数 | 语义 | 夜班 |
+     |---|---|---|
+     | `after_seconds` | N 秒后**一次性** | ❌ 一次性错过即永失（本次实测翻车） |
+     | `at` | 指定绝对时刻**一次性** | ❌ 同上 |
+     | `every_seconds` | 固定间隔循环（**≥60 秒**，从创建时刻对齐） | ✅ **唯一允许**，值 = `heartbeatSeconds` |
+     | `daily` | 每天固定本地时刻 | ❌ 唤醒延迟上界可达 23 小时 |
+     | `weekly` | 每周指定星期几时刻 | ❌ 同上且粒度过粗 |
+     | `cron` | 五字段 cron 表达式 | ❌ 等间隔虽可表达（`*/15 * * * *`），但引入方言风险 + 与 `heartbeatSeconds` 双时间源必然漂移 |
+
+     判据一句话：**崩溃恢复要的是"最坏等待 ≤ 一个周期"**。`every_seconds` 恒满足；日历型（`daily`/`weekly`/`cron`）在"刚触发完就崩"场景下没有"错过的时点"可补，得等满一整个周期。六选子表与 cron 方言限制见 `INTERNAL-dsh-mechanisms.md §2.2`。
+   - **删除时机：写完 brief 之后再删心跳**（顺序：任务全 ✅ → 写 brief/summary/DECISIONS → 记历史行 → `schedule_delete`）。**不要为了省积压而提前删**：提前删能省的积压很有限，代价却是 brief 写到一半崩溃时**没有任何东西会再叫醒本会话**，用户得手动重建——不值得。压积压靠下面的间隔选型，不靠顺序。
+   - **收尾最后一步：清空积压的收件箱（有工具就必须调，不是可选）**：`schedule_delete` 之后，**检查本次会话的工具列表里是否存在 `sweep_schedule_inbox`**——
+     - **存在 → 必须调用一次**（这正是它存在的意义：清掉排队的残留心跳，避免完成后的几十轮空转）；调用失败或返回异常 → 记 ESCALATION，不要静默跳过。
+     - **不存在（没装 `dsh-plugin-schedule-sweep`）→ 跳过**，不报错、不阻塞收尾。
+     - 判断方式是"工具在不在列表里"，不是"我记得装没装"。**2026-11-01 实测**：装了插件但模型从没主动调，残留心跳继续空转——所以这里写成**硬要求**（有则必调），而不是"可选增强"。
+   - **删除前先记历史**：`schedule_*` 没有"标记完成"这个状态（只有 create/update/delete/list），周期提醒删掉即从 DSH「自动化任务」UI 消失、不留痕——**所以 `night-shift/HEARTBEAT.md` 的历史区才是心跳的唯一历史账**。删除时**先追加一行**再删：`心跳 id / every_seconds 间隔 / 建立时刻 → 删除时刻 / 删除原因（任务全 ✅ 完成收尾 \| blocked 中止 \| 用户叫停）`。DSH UI 只有标题 + 间隔，信息量远小于本文件，不要指望 UI 当记录。**顺序不能反**：先写历史再 `schedule_delete`，否则中途崩溃就两头皆空。
+   - **积压控制（读源码+实测确认，2026-11-01）**：心跳每 N 秒把一条提醒 `followup()` 推进 **agent 收件箱**；模型忙（长 turn）时消息堆在收件箱，空闲后**每条各起一轮 turn**。`schedule_delete` 只删任务行（平台文档原话 **`leaving queued messages intact`**），**清不掉已进收件箱的消息**——所以删完仍会空转若干轮。推论：
+     - **积压数 ≈ 工作时长 ÷ 心跳间隔**。60 秒 + 干 2 小时 ≈ 120 轮空转；900 秒 ≈ 8 轮。
+     - **间隔选型规则（分装没装插件）**：**装了 `dsh-plugin-schedule-sweep` → 300s（5 分钟）**（完成后积压被 sweep 清空，间隔回到推进节奏，300s 又不至于堆太多）；**没装插件 → 900s（默认，并建议去装插件）**（没 sweep 兜底，只能靠大间隔压完成后空转）。保底约束：`heartbeatSeconds` ≥ 单个任务预计时长 × 6（最坏空转 ≤6 轮）。例：任务 2 分钟 → 120s；任务 10 分钟 → 600s。**60s 只用于测试，不留真实夜班**。
+     - **排空轮必须廉价**：心跳提示词写死"若已判定收尾 → **不读文件、不调工具**，只回一行结束本轮"（成本 = 一次历史 input，不是任务本身）。
+     - **可选根治**：若主机装了 [`dsh-plugin-schedule-sweep`](http<WORKSPACE>)（可选增强，**不装不影响使用**），收尾时在 `schedule_delete` 之后调一次 `sweep_schedule_inbox`，把收件箱里 `source.kind==='schedule'` 的待处理消息全部删掉（只删心跳消息，不动用户消息）。**装不了/没装就跳过这一步**，不要因此报错。
+   - 心跳提示词模板（**必须原样用，顺序不能改**）：`夜班心跳：① 先自判是否已收尾——若任务清单已全部 ✅/blocked，或本会话此前已执行过 schedule_delete → **不读任何文件、不调任何工具**，只回一行"心跳空转：已收尾，无需动作"并结束本轮；② 未收尾 → 读 night-shift/HEARTBEAT.md 与任务清单文件；③ 任务清单全部 ✅/blocked → 按 SKILL.md 收尾流程执行：**先写 brief/summary/DECISIONS，再写 HEARTBEAT.md 历史行，再 schedule_delete，最后若工具列表里有 sweep_schedule_inbox 就调用它清积压**（顺序不可颠倒：brief 必须在删除之前写完）；④ 未完成 → 按 SKILL.md 继续推进；⑤ 发现中断痕迹（无当天 briefs 却有进行中记录）→ 先补写中断说明再继续。`
+6. **跨项目运行登记表与外部看门狗（主机级，单例；看门狗用于崩溃恢复，不做开机自启）**：开工时在**主机级运行登记表**（`$DSH_HOME/night-shift/runs/` 下的 JSON 清单，**与 Windows 系统注册表无关**）写一条 run（`runs/<sessionId>.json`，含 workspace / sessionId / startedAt / heartbeatId），收尾删除——**多项目并发各写一条，互不覆盖；看门狗全局只有一个**。看门狗**只在"运行登记表有活动 run 且 DSH 进程不在"时拉起**；运行登记表为空（未跑夜班）→ 检查完即退出，**绝不无条件启动 DSH**（用户不打开 DSH = 当前不需要它）。未安装看门狗时降级：崩溃后用户手动打开 DSH，心跳提醒自动恢复冷会话并续跑。三条防误杀：① 条目 `startedAt` 超 **18 小时**视为陈旧，看门狗忽略；② **心跳、run、项目内状态同生共死**（删心跳必删 run）；③ v1 看门狗**只判"进程不存在"**，进程活着绝不动手。若日后加"卡死"判定，**只能看引擎写的会话日志**（`session.jsonl.zstd` 最后写入时间；心跳每 15 分钟投递会产生写入），**不能看模型写的文件或任务时长**——长任务（>1 小时）期间模型在忙，用模型写的信号判存活会把"忙"误判成"死"。阈值 = 2×心跳间隔 + 10 分钟余量。完整设计（运行登记表协议 / 看门狗算法 / Windows 与 macOS 差异 / 安装）见 `references/host-level.md`。
+7. **重试耗尽 ≠ 重启信号**：模型重试（默认 5 次）耗尽 → 该轮以错误结束、会话空闲 → **下一轮心跳继续**（**不需要重启进程**）。**连续 ≥3 轮心跳都以同类错误失败**（401/余额不足/服务不可用）→ 判定环境不可用：**删除心跳、标 blocked、写 `briefs/<日期>.md` 说明原因**，不整夜无效重试。只有"进程死/卡死"才由看门狗重启。**不改全局 `retryPolicy`**（provider 级配置会影响白天所有会话）；需要更久重试时由用户按需调 `maxRetries`。
+
+8. **挂机门禁（人在场时，本 skill 的"你别走了"确认——没打勾不许放人走）**：用户说完"我走了"之后，**在人类消息当轮内**依次建立并**逐项实测**下列四件，然后输出固定格式的门禁块；**只要有一项 NO，就明确告诉用户"现在挂机不会自恢复，需要你先 X"，不得放行**。这一步存在的原因：用户发完消息就离开，而续跑链路任何一环缺失，第二天看到的都是"任务从没开始"（2026-11-01 实测两次翻车的教训）。
+
+   | # | 项 | 通过判据（必须实读文件/实调工具，不许凭印象） |
+   |---|---|---|
+   | 1 | **Goal 已挂** | `get_goal` 返回有效 goal id（不是 null/error）。若被拒（"requires a direct human turn"）→ 立刻在**本条人类消息当轮**重试，仍失败则 NO |
+   | 2 | **续行已启用** | 挂 Goal 后看返回值/状态确认续行；若会话曾 resume/fork 导致续行停用 → NO（需用户明确授权 resume） |
+   | 3 | **心跳已建** | `schedule_create` **用 `every_seconds`** 建周期提醒并返回 id；再用 `schedule_list` 确认该 id 确实在列；id 已写入 `night-shift/HEARTBEAT.md` |
+   | 4 | **run 已登记** | `$DSH_HOME/night-shift/runs/session-<本会话>.json` **实读存在**且含 workspace/sessionId/startedAt/heartbeatId 四字段 |
+
+   四项全 YES 后，**用下面这个块作为本阶段唯一输出**（原样照写，数字换成实测值）：
+
+   ```
+   ✅ NIGHT-SHIFT READY TO LEAVE
+   goal_id:        goal-xxxx（max_goal_rounds=20~40）
+   continuation:   enabled
+   heartbeat:      every_seconds=900（下次触发约 <HH:MM>，id schedule-xxxx）
+   run_file:       ~/.dsh/night-shift/runs/session-xxxx.json（已实读）
+   watchdog:       installed / not installed（降级：崩溃后需手动开 DSH）
+   以上四项已实测通过，你现在可以离开了。
+   ```
+
+   **门禁块必须"双信号"落地：文件留证 + 聊天可见**——2026-11-01 实测两次：模型做完了门禁四件事，但**只产工具调用、没输出任何文本块**，直接去写 `index.html`，用户在聊天窗口里完全看不到"可以走了"的信号。只靠"模型主动说一句"会漏，只靠"写文件"用户又看不见。所以两条都要：
+
+   1. 门禁四项实测通过后，**用 `write` 工具写 `night-shift/GATE.md`**，文件内容就是上面的门禁块（原样，数字换成实测值）——这是**磁盘留证**，跳不过、事后可查；
+   2. **紧接着调 `present` 工具**，把刚写的 `night-shift/GATE.md` 作为交付物呈现（`files: [{path: "night-shift/GATE.md", description: "夜班门禁通过，可以离开设备"}]`）——这会在**聊天窗口里弹出卡片**，用户一眼看到「✅ 可以离开」；
+   3. **本轮回复正文里也要原样贴一遍门禁块**（三重保险：文件 + 卡片 + 正文）；
+   4. **没有 `night-shift/GATE.md` 就动手写任务产物 = 违规**，事后必须补齐并记 ESCALATION。
+   5. **做以上事情之前，禁止创建任何任务产物**（不许写 `index.html`、不许截图、不许改代码、不许提交）——门禁四件套（挂 Goal / 建心跳 / 写 run / 改 `HEARTBEAT.md`）+ 写 `GATE.md` + `present` 是**唯一允许的动作**，全部必须在**人类消息当轮**完成。
+
+   任何一项 NO → 写 `night-shift/GATE.md` 内容为 `❌ NOT READY: <哪一项> <缺什么> <我需要你现在做什么>`，**并且 `present` 它**（让用户在聊天里直接看到红牌）。**禁止**在没写 GATE.md 的情况下自己开始跑任务。
+
+**退出模式**：用户回到电脑前（或说"我回来了"）即退出夜班模式——恢复"该问就问"，夜班默认处置不再生效；未完成的 goal 由用户决定是否 resume。
+
+**项目初始化（每次进入先查、只做一次）**：按 `references/project-init.md` 检查工作区根 `AGENTS.md` 是否带 `<!-- night-shift-knowledge:v0 -->` 标记——无标记则按项目类型（代码/非代码）**注入指针块**（约 10 行：类型 + 集中层路径 + 规则正文指针 + 项目差量；规则正文留在 skill 单一真源，**不复制全文**；已有内容一字不动，只追加）；有标记则跳过。知识沉淀规则属**项目级**工作流，不写全局。首夜把指针解析后的绝对路径回显进 BRIEF"预检执行情况"区，验证真的加载到。
+
+## 1. 三句总原则
+
+1. **验收门禁是唯一裁判**：测试/验证**证据**绿了才算完成，"我觉得修好了"不算。
+2. **不等人**：拿不准就按 §4 习惯默认处置 → 记入 `DECISIONS.md` → 继续推进。人不在场，问了也没人答；流程不为人工晨检暂停。
+3. **三条红线永不越**：`git push`、C 级禁区（系统目录/凭据/Windows 注册表等）、**修复类任务装新依赖**——在任何模式下都禁止，无例外。
+
+## 2. 主流程
+
+0. **开工预检（人在场时先做，细则见 `references/habits.md` §〇）**：**先 `get_goal` 确认 Goal 状态**（用户若已用 `/goal` 发起，goal 已在；没有才 `create_goal`，且必须在**这条人类消息当轮内**完成——拖到预检之后的自动轮次会被引擎拒 `requires a direct human turn`，2026-11-01 实测）→ 完成 §0 项目初始化 → 扫一遍任务列表 → 写 `night-shift/preflights/<日期>.md`（需求歧义 / 设计取舍 / 预测依赖及出处）→ **一次性**向用户提完"必须现在定"的问题，可当场预授权包名 → 按答复执行；没答的落回习惯默认。
+1. **执行 §0 第 8 条挂机门禁**：四项实测全 YES → 写 `night-shift/GATE.md` → `present` 它 → 正文复述门禁块（三重信号，缺一不可）；`max_goal_rounds` 用**保守**值（建议 **20~40**：够干完一批任务，又不至于模型挂掉时整夜空转；耗尽会记 `round-limit` blocker 自动停止）。门禁三信号落地后再进入第 2 步开始干任务。
+2. **任务清单必须落文件，禁止写进对话/goal**：
+   - **优先级（显式指令 > 约定文件名）**：① **prompt 里指定的路径**——用户写好清单只给路径，**该文件即清单本体，原地编辑、不复制、不改名、不新建 BUG-BOARD.md**（txt/markdown 都行，但会被写状态标记，别指向不想改的文件）→ ② 工作区已有的 `BUG-BOARD.md` / `TODO.md`（仅在**没有指定路径**时才用）→ ③ 都没有才在工作区根新建 `BUG-BOARD.md`（模板见 `references/templates.md` §6）。⚠️ 第①条必须压过第②条：上一夜留下的旧 `BUG-BOARD.md` 往往已全 ✅，若让它盖过本次指定的清单，等于任务从没开始。
+   - **`create_goal` 的 objective 只留一行**：`完成 <清单绝对路径> 里的全部任务（逐条标 ✅ 并附总结链接）`。**禁止把清单正文、任务详情、验收标准写进 objective**——写进对话或 objective 的内容，每一轮唤醒都会随会话历史重付一次，且**无法人工修订**；落文件后模型按需 `read`，未读部分不产生任何成本（2026-11-01 实测：测试 #4 的 objective 里塞了整段 prompt，998 字符）。
+   - **为什么文件优于对话**（三条硬理由）：① **可人工干预**——用户中途醒来加一条 / 砍一条 / 改优先级，直接改文件即可，不必发消息打断夜班；② **可续跑**——恢复后 `read` 一次拿全量进度，不怕会话历史被压缩后任务正文糊掉；③ **可溯源**——清单 + ✅ + 总结链接留在工作区，晨检直接看文件，第二天还能接着挂机复用同一份清单。
+   - **每轮心跳第一件事是 `read` 清单**（不要凭对话记忆里的任务），据其判断进度与下一项。
+   - **用户在对话里直接列任务（"任务1 任务2 任务3"）时，开工第一件事是把它原样抄进清单文件**，然后再挂 goal 指向文件——**禁止直接按对话里的清单开工**。抄完可回一句"任务已落到 <路径>"，让人类知道清单在哪、中途去哪改。任务多少不影响这条：三条也落文件，因为后续每轮心跳、人工干预、续跑都走文件。
+   - **状态标记用四种**（模板与示例见 `references/templates.md` §6）：`- [ ]` 待办 / `- [x]` ✅ 完成 + 总结链接 / `- [~]` ⚠️ 完成有残留（写明残留）/ `- [!]` ❌ blocked（写明卡点）。**完成后不删条目**，只改标记并补链接（原始层纪律；清理由用户白天决定）。
+3. **每个任务**按序执行：
+   1. **调研先行（三步，与项目 AGENTS.md 模板一致）**：① 集中通用层 `<centralKnowledge>`（路径见主机级 `config.json`）→ ② 本项目 `knowledge/research/` 与 `knowledge/pitfalls/` → ③ 外部 GitHub/社区/官方文档；结论记入总结"引用来源"（查过无也要写"查过 X 无现成方案"）。
+   2. 实现（改代码/改测试）。
+   3. 验证（§3）拿到证据。
+   4. 提交（§5：一任务一提交）。
+   5. 写任务总结（§6）。
+   6. 下一项。
+4. **派工层换成 Agent Teams 持久队友**：本仓**不使用** `subagent` / `subagent_fork`（编排选择；2026-11-06 实测两套工具可在同一实例共存，见 §2A.1）。独立可并行的任务由 **Lead** 用 `spawn_teammate` 建立**全持久队友**、`team_task_create/get/list/update` 维护共享任务板、`send_message` 下发与打回、必要时 `interrupt_agent` 打断；**Lead = 主会话，常驻，不 spawn**。串行修复回路仍留在主上下文（测试失败 → 修复 → 再测），但跨任务返工走「打回**同一 doer** + 送回**同一审阅**」的闭环（见 §2A）。
+   - **模型**：`SpawnTeammateRequest` 没有 `model` 字段，队友**一律继承会话模型**，不可单独配便宜模型，`list_agents` 里的 `provider?/model?` 只是展示字段；模型路由能力由 A 仓 `night-shift` 承担。
+   - **共享 cwd、无 fs 锁**：队友共享工作目录，靠 `write_scopes`（**advisory 非锁**）或 `worktree` 分支划清写范围；「审阅」队友**只读**，不改代码。
+   - **共享任务板**：`team_task_*` 的 CAS 语义（先 `team_task_get` 取最新 `revision`，再 `claim` / `complete`）天然支持多队友并发；任务依赖用 `blocked_by`。
+   - 完整编排见 §2A 与 `references/team-mode.md`。
+5. 同一任务**连续 3 次换方案仍失败** → 标记 blocked、记 `DECISIONS.md`、跳下一项，不整晚死磕一个任务。
+6. 全部任务完成或额度耗尽 → 写当天简报 `night-shift/briefs/<日期>.md`（不覆盖旧档），更新 `BRIEF.md` 指针（§6），收尾。
+
+## 2A. 团队模式（Agent Teams 派工层，B 仓核心）
+
+> A 仓的全部机制（§0 门禁 / 心跳 / 看门狗 / 预检单 / §2 任务清单 / §3 验证 / §4 习惯 / §5 git / §6 产出 / §7 升级）**一条不少**，本节只描述**派工层**的替换与新增。规则正文见 `references/team-mode.md`。
+
+### 2A.1 每对话必做：插件轨道自检（先于项目初始化与门禁）
+
+Agent Teams 由 **profile 的 `dsh.profile.bundles`** 决定，是**实例级全局**开关；新对话只能选 preset，选不了 profile。启动本 skill 的每个对话，先机器自检：
+
+| 检查 | 通过判据 | 不通过 |
+|---|---|---|
+| B 轨可用 | 本会话工具列表里存在 `spawn_teammate` / `list_agents` / `send_message` / `interrupt_agent` / `team_task_create/get/list/update` | **门禁不放行**：不弹 `present` 卡片、不生成 `GATE.md`、不挂 Goal；报错 + 切轨指引（改 bundle 并重启 DSH）；**不降级、不静默继续** |
+| git 工作树（**按场景**） | 仅 `isolation: worktree`（编码 + git）时要求 `create_worktree` 存在 | 缺它 → 该场景改用 `isolation: write-scopes` 或启用「git 工作树」插件；**不阻断 content / collect 场景** |
+
+> ⚠️ **不要以「`subagent` / `subagent_fork` 是否出现在工具清单里」作为判据**。2026-11-06 实测：启用 Agent Teams 的实例上，这两个工具**仍列在工具清单里、系统提示未标注不可调用**，同时 `spawn_teammate` 等团队工具也齐全；旧判据「A 轨已让位 = 工具被禁用」会**恒判 FAIL**，把可用环境误判成故障。本仓**不使用**它们是编排选择（§2 第 4 条），**不以工具是否可用来判定轨道**。
+>
+> **A/B 不可混用的真实理由**：两个 skill 争用同一套运行时基础设施（状态目录 / 决策日志 / 心跳 / 运行登记表 / Goal / 看门狗单进程假设）且编排互斥；不是「工具被禁」。
+
+通过则静默继续，不占用用户睡前 3–5 分钟；失败才升级为预检单待办并阻断门禁。自检时机：每个启动本 skill 的对话、项目初始化阶段、挂 Goal 与门禁前。另加一项 **「工作区未被其他 run 占用」** 自检（读 `runs/<sessionId>.json` 的 `workspace`）。详见 `references/project-init.md`。
+
+### 2A.2 启动配置（声明式，数据驱动）
+
+| 文件 | 作用 |
+|---|---|
+| `references/team-roster-dev.md` | 开发花名册：领导（Lead＝主会话，**不 spawn**）+ `新增`/`修复`/`界面`/`审阅`（`feature`/`bugfix`/`ui`/`review`） |
+| `references/team-roster-content.md` | 非开发花名册：领导 + `通用`/`审阅`（`general`/`review`） |
+| `references/project-profile.md` | 声明式字段：`projectType` / `vcs` / `isolation` / `reviewTarget` / `delivery` / `evidence` |
+| `references/team-mode.md` | 编排规则、任务卡字段、状态机、返工闭环、熔断、`RESULT:` 结构化结论 |
+| `references/context-pack.md` | 项目结构摘要 / 架构约定 / 累积 `review_notes` / 各轮 diff 与 evidence 索引 |
+| `references/validation-checklist.md` | 非编码通用验收 L0–L4 |
+
+由 `project-profile.projectType` 决定加载哪份 roster——**加预设只加文件，不改编排逻辑**。内部名必须 `lower-kebab-case`（工具限制），中文名用于任务卡 / 简报 / GUI。
+
+### 2A.3 主流程（用户已看到门禁卡片并离开后）
+
+1. **Lead 读** `team-roster-*.md` + `project-profile.md`。
+2. **拆票建卡**：`team_task_create` 建共享任务板（Web GUI 可见），字段 `owner` / `blocked_by` / `status` / `round` / `review_notes` / `write_scopes`。依赖用 `blocked_by`；`team_task_update` 是 **CAS**（先 `team_task_get` 取最新 `revision`，再 `claim` / `complete`）。
+3. **遍历 roster → `spawn_teammate`**：全持久队友（含只读「审阅」），**Lead 不 spawn**；`list_agents` 查名册，`send_message` 用返回的 target 通信（`inactive` ≠ 任务完成）。
+4. **Lead 下发 `context-pack`**：新会话装载一次；会话内沿用持久队友自己的记忆。
+5. **隔离**（按 `project-profile`）：编码 + git → `create_worktree` 分支（`feature/` / `fix/` / `ui/` + 任务 id），doer 在自己分支提交；其余 → `write_scopes` 按输出路径前缀分配（**advisory 非锁**）。
+6. **doer 干活 + 自验 + evidence**（§3 证据制不变），卡 `status → review`。
+7. **「审阅」持久队友**（只读，共享 cwd、不改代码）：读分支 diff 或内容清单 L0–L4，出 `RESULT: PASS` / `RESULT: FAIL`。**不做审美评审**。
+8. **PASS** → 卡 `done` → 交付；**FAIL** → 返工闭环（§2A.4）。
+9. **交付**：git 项目仅 `done + PASS` 后由 **Lead 在 `main` 顺序 `git merge`**（产生 merge commit 记录）；冲突 / 二进制 → `blocked` 交白天，**不 rebase / amend / force**。非 git / 内容项目 → 交付目录汇总，无 merge。
+10. **晨间简报按角色汇总** + 升级标记 + 依赖变更行；`git push` / 开 PR / 清理已合并 worktree 分支 / 非编码产物最终发布 / 依赖变更复核 / 所有 `blocked` 卡人工裁定 → **留白天**。
+
+### 2A.4 返工闭环（双方都带上下文）
+
+```
+审阅 FAIL → review_notes 追加（累积，不覆盖）+ round += 1
+  → round >= 3 ? 或 本轮改动与上一轮实质相同（空转）? → blocked + 升级标记 → 简报「待白天裁定」
+  → 否 → send_message 带累积意见打回【同一 doer】队友
+  → doer 带上下文改（同分支增量 commit / 同交付路径）
+  → 卡 → review → 送回【同一个「审阅」】队友（它记得上轮问题，可验证是否真修）
+  → RESULT: PASS → done；FAIL → 回到本闭环开头
+```
+
+### 2A.5 参数与熔断
+
+| 项 | 值 |
+|---|---|
+| 单卡 `maxRounds` | **3**（与引擎默认对齐） |
+| 会话级熔断 | 累计 `blocked >= 3` 或时长触顶 → 停止派新卡、只收尾 |
+| 空转检测 | 本轮 diff / 产物与上一轮实质相同 → 立即 `blocked` |
+| 单会话队友并发 | 开发 **4** / 非开发 **2**（= roster 预设） |
+| 一晚并发会话数 | ≤ 3（建议值，非硬值） |
+| 总时长 | 硬上限 `staleHours=18`；实际预算 = 人离开到回来 − 30 分钟缓冲（写进预检单） |
+| 合并目标 | 本地 `main`，顺序、仅 `done + PASS` 后 |
+
+**沿用 A 仓 / 引擎默认不改**：心跳 `900` 秒且必须 `every_seconds` 周期（**非** `after_seconds`）、看门狗 10 分钟 + `watchdog.lock` 单例锁、`enableStallCheck=false`、`stallMinutes=40`、`staleHours=18`、`max_goal_rounds=30`（建 goal 时给，不写进 `config.json`）、`blockedAfterConsecutiveRounds=3`、门禁四信号、预检单挂 Goal 前写完。
+
+### 2A.6 预检单（B 仓）
+
+**机器自检（静默通过；失败才升级 + 门禁不放行）**：agent-team 插件已启用；主机级看门狗 / 心跳 / 调度 / 运行登记表已装；本工作区未被其他 run 占用；是否 git、磁盘、依赖、git 状态、项目类型。
+
+**需人睡前答（3–5 分钟，或一句「都按你建议的」）**：① 本会话用哪份 roster 预设 ② 非编码项目专属规格（尺寸 / 比例 / 时长 / 页数 / 命名 / 主题） ③ 时长预算、合并目标 `main`、白天清单确认 ④ 预测依赖预授权。未答项落回 §4 习惯默认 + 记 `DECISIONS.md`；遵守 `habits.md` §〇「默认表能覆盖的不进预检单」。
+
+## 3. 验证协议（证据制）
+
+报"完成"必须附证据，无证据视为未完成、进入修复回路。取证细则见 `references/verification.md`。
+
+| 任务类型 | 最低证据要求 |
+|---|---|
+| 改代码逻辑 | 测试命令输出（含通过数）+ typecheck/lint 通过 |
+| 改 UI/页面 | 无头 Playwright 截图（绝对路径存 `night-shift/evidence/<日期>/`）+ console 无新增报错 |
+| 改 CLI/脚本 | 真实运行一次的输出尾部 |
+| 修 bug | 先复现（红）再修复（绿）的两次输出对比 |
+
+**团队模式补充**：doer 自验证据之外，「审阅」持久队友按 `references/validation-checklist.md`（非编码 L0–L4）或分支 diff 出 `RESULT: PASS/FAIL`；**PASS 才算 `done`**，FAIL 进 §2A.4 返工闭环。证据仍按上表落 `night-shift/evidence/<日期>/`，**复用旧证据 = 证据造假**（`references/verification.md` 的防伪规则不变）。
+
+## 4. 习惯决策树（三档）
+
+完整版与示例见 `references/habits.md`。摘要：
+
+| 档 | 处置 |
+|---|---|
+| **自由区** | 工作区内读写源码/测试/文档、跑测试/构建/lint、重启本地服务、无头浏览器验证、写 `night-shift/*`、写 `knowledge/`、按 lockfile 还原依赖（`npm ci` 类，不改依赖图）——直接做，不问 |
+| **禁区** | **修复类任务装新依赖**、不满足四条件（出处/锁版本/卫生/可回滚）的功能类依赖、删除文件、`git push`、`commit --amend`/`rebase`/`reset --hard`、写工作区之外任何位置、触碰 C 级目标——**永不执行**；需要时记入简报等人 |
+| **拿不准** | 按默认倾向做（见 habits.md 示例表：设计取舍选最简单且合仓库惯例的路；功能类缺依赖先走来源白名单三查，仍无路再 blocked；网络类失败交给重试）→ 记 `DECISIONS.md`（时间/情况/选择/理由/来源级别）→ 继续 |
+
+**依赖引入按任务类型分治**（完整规则见 habits.md §〇-1）：
+
+- **修复类（修 bug/重构/性能）**：装新依赖 = 红线，永不执行——修复有纯本地替代路径，装包会改变故障面、掩盖真因。
+- **"重新定性为功能"须用户确认**（防一句话绕过红线）：夜间判定"这其实是功能"时**不装包**——blocked + 简报"待定性"；只有预检单里用户明确同意（或白天裁定）后，当晚才可按功能类走。
+- **新增功能类**：走**档 2 来源白名单**——同时满足①开工调研有出处（官方文档/GitHub 项目/知识库记录）②精确锁版本③卫生（默认 registry/防拼写劫持/禁 `--force`/禁全局安装）④单独 `chore(deps):` commit 可回滚（AGENTS.md §2.1 依赖豁免已于 2026-10-30 落地），才可安装；装完简报单列供晨检 diff。
+- **预检预授权优先**：开工预检时用户当场点名"允许装 X"的，按预授权执行（等价于来源白名单 + 你亲自背书）。
+- 任何装包动作都记入 `DECISIONS.md` 并标来源级别（预授权 > 白名单 > 默认），晨检从低级别看起。
+
+## 5. git 规则（commit 豁免已落地）
+
+- **自主 commit：已授权**（全局 AGENTS.md §4.1.1"夜班/多任务挂机 commit 豁免"，2026-10-30 写入，动机=**按任务分隔工作区**）：夜班/无人值守模式下**一任务一提交**——不许把多个任务攒成一坨，不许把无关改动混进来。
+- commit 信息遵循 `commit-message` skill（若已安装），并附一行测试状态（如 `test: 12 passed`）。
+- **永不 push**（豁免明确排除 push）；永不改写历史（amend/rebase/reset --hard）；不用 `git commit -a` 等自动提交工具。
+- diff 审查从"提交前逐次看"变为**晨检时看**：BRIEF"git 状态"列出本夜全部 commit 供审计。
+- **违规即撤销**：隐瞒测试失败的提交 / 混入无关改动 / 任何形式 push → 豁免失效、退回逐轮授权，并主动写进简报报告。
+- C 级禁区不受任何豁免影响。
+- **B 仓合并规则**：doer 的提交仍走「一任务一提交」豁免；**仅 `done + RESULT: PASS` 后由 Lead 在本地 `main` 顺序 `git merge`**（产生 merge commit 记录）。冲突 / 二进制一律 `blocked` 交白天，不 rebase / amend / force；清理已合并 worktree 分支留白天（worktree 插件只创建、不删除）。`git push` / 开 PR 永远人工闸门。
+
+## 6. 产出物（模板见 `references/templates.md`）
+
+- **任务总结** `night-shift/summaries/<日期>-<任务名>.md`：任务与结果 / 踩过的坑 / 更好的实现方式 / 可复用片段 / 引用来源。
+- **晨间简报** `night-shift/briefs/<日期>.md`（按日期留档；`BRIEF.md` 仅作最新指针）：完成清单（含 blocked）/ 决策要点（DECISIONS 摘录）/ commit 列表与 diff 概要 / 测试状态 / **待拍板清单**（非阻塞，默认处置已记录）/ 升级候选新增。
+- 简报是**事后审计件**：夜班不等任何人审阅；push 留给用户白天检查后手动执行。
+
+## 7. 升级标记（本技能的自我边界）
+
+执行中遇到"**这次靠默认蒙对了，但规则没法保证下次**"或"**需要引擎在我不参与时做事**"的场景，记一行到 `night-shift/ESCALATION.md`：
+
+```
+- [时间] 场景：<一句话> | 这次怎么处理的：<默认动作> | 为什么 skill 不够：<缺少确定性/时机/强制力>
+```
+
+典型触发：需要定时自动开跑、担心模型忘记写简报、想硬性拦截 push、发现人工评审反复批注同一类问题（该变 lint 规则）。这些是将来升级为脚本/插件的原料，README"升级路线"有对应方案。
