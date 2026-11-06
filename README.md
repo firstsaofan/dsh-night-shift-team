@@ -124,6 +124,8 @@
 
 ## 与 A 仓 `night-shift` 的区别（该选哪个）
 
+> 🔗 **姐妹仓库**：个人 / 小项目、想要「worker 便宜模型 / 主循环贵模型」的模型路由 → 用 [**night-shift**（原仓）](https://github.com/firstsaofan/dsh-night-shift)。本仓用 Agent Teams 全持久队友 + 共享任务板 + 持久审阅 + 返工闭环，面向中大型项目；**同一 DSH 实例不可混用**（详见下节）。
+
 > 两个仓库是**同一套无人值守基础设施的两种派工实现**：A 仓用 `subagent` 一次性子代理，B 仓用 DSH 内置 Agent Teams 全持久队友。**A 仓一行未改**；除派工层外，门禁 / 心跳 / 看门狗 / 预检单 / 决策日志 / 简报 / 证据制 / 熔断全部一样。
 
 ### 规格对照
@@ -530,7 +532,7 @@ habit 规则（habits.md 默认表 + 夜班 preset）在正式挂机前用 eval 
 ### 已落地的配套插件：`dsh-plugin-schedule-sweep`
 
 目前唯一从"升级路线"变成真实代码的配套插件，开源地址：
-<http<WORKSPACE>>
+<https://github.com/firstsaofan/dsh-plugin-schedule-sweep>
 
 它解决**任务完成前心跳堆积、完成后空转烧 token** 的问题（心跳每 N 秒往 agent 收件箱推一条提醒，
 `schedule_delete` 清不掉已排队消息）。装了它，skill 收尾会多调一次 `sweep_schedule_inbox`
@@ -538,7 +540,7 @@ habit 规则（habits.md 默认表 + 夜班 preset）在正式挂机前用 eval 
 
 ```powershell
 # 从 Git 直接装（仓库自带构建产物，无需本地 build），装完重启 DSH
-dsh plugin --profile desktop add http<WORKSPACE>
+dsh plugin --profile desktop add https://github.com/firstsaofan/dsh-plugin-schedule-sweep
 ```
 
 #### 装好后怎么验（两级）

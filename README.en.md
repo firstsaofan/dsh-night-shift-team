@@ -127,6 +127,8 @@ Without them the skill does not fail, but it will stall at night waiting for a h
 
 ## Which repo should you use?
 
+> 🔗 **Sibling repo**: for solo/small projects, or when you want cheap-worker / expensive-orchestrator model routing, use [**night-shift** (original repo)](https://github.com/firstsaofan/dsh-night-shift). This repo uses persistent Agent Teams teammates, a shared task board, a persistent reviewer and a rework loop for medium/large projects; **the two cannot be mixed on the same DSH instance** (see below).
+
 > Both repos are **the same unattended infrastructure with two different dispatch layers**: A (`night-shift`) uses one-shot `subagent` calls, B (`night-shift-team`, this repo) uses DSH's built-in Agent Teams **persistent teammates**. A is unchanged; the gate / heartbeat / watchdog / preflight / decision log / brief / evidence rules / circuit breaker are identical.
 
 ### Spec comparison
